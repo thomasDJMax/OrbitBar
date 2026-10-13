@@ -1,0 +1,32 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orbitbar-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Swift toolchain
+        run: swift --version
+      - name: Test core behavior
+        run: swift test
+      - name: Test settings and login behavior
+        run: bash scripts/test-settings.sh
+      - name: Test Bluetooth output callback ordering
+        run: bash scripts/test-bluetooth-bridge.sh
+      - name: Test interrupted release recovery
+        run: python3 scripts/test-build-transaction.py
+      - name: Build release application
+        run: bash scripts/build-app.sh --universal
+      - name: Validate developer scripts
+        run: bash -n scripts/build-app.sh scripts/render-preview.sh scripts/test-settings.sh scripts/test-bluetooth-bridge.sh
