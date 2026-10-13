@@ -1,5 +1,7 @@
 # OrbitBar
 
+[![Build and test](https://github.com/thomasDJMax/OrbitBar/actions/workflows/ci.yml/badge.svg)](https://github.com/thomasDJMax/OrbitBar/actions/workflows/ci.yml)
+
 OrbitBar 是一个原生 macOS 菜单栏小工具，将底部开口的电量弧、中心网络标记和沿底部弧线排列的四点音量合在一个图标里。视觉灵感来自 iPhone Duo 风格的组合状态图标；这是独立编写的 Swift 实现，使用自己的名称和图标。
 
 ## 下载
@@ -95,7 +97,7 @@ bash scripts/build-app.sh --universal
 - `python3 scripts/test-build-transaction.py`：11 项发布故障测试全部通过，覆盖并发、签名失败、替换失败、中断恢复及运行目标检测。
 - 通用 Release 构建成功，产物包含 `arm64` 和 `x86_64`；应用签名和 ZIP 完整性校验通过。
 - 本机打开 1.2.2 状态面板，确认电池、Wi-Fi、内置扬声器与“允许访问后显示连接设备”状态正常，音量明确标注“音量 69%”。1.2.1 已确认原有 110% 宽度、2.15 pt 粗细及配色／百分比开关保留，本次没有修改这些偏好。耳机电量与连接时序尚未使用目标耳机实测。[新版实机面板截图](previews/bluetooth-panel-1.2.2.jpg)
-- `.github/workflows/ci.yml` 已配置核心测试、设置回归、蓝牙回调回归、发布故障测试、通用构建与脚本语法检查；尚未在远程 GitHub Actions 上运行。
+- `.github/workflows/ci.yml` 在 GitHub 推送和 pull request 时执行核心测试、设置回归、蓝牙回调回归、发布故障测试、通用构建与脚本语法检查。[查看远程验证结果](https://github.com/thomasDJMax/OrbitBar/actions/workflows/ci.yml)
 
 Intel 架构已编译，尚未在 Intel 机器上运行验证。蓝牙授权后的设备连接／断开、左右耳／盒电量、登录项注册、睡眠唤醒、低电量模式及不同音频硬件仍需相应环境实测。
 
