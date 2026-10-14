@@ -24,9 +24,13 @@ jobs:
         run: bash scripts/test-settings.sh
       - name: Test Bluetooth output callback ordering
         run: bash scripts/test-bluetooth-bridge.sh
+      - name: Test native animation lifecycle and publisher ordering
+        run: bash scripts/test-animation.sh
+      - name: Test partial icon redraw pixels
+        run: bash scripts/test-rendering.sh
       - name: Test interrupted release recovery
         run: python3 scripts/test-build-transaction.py
       - name: Build release application
         run: bash scripts/build-app.sh --universal
       - name: Validate developer scripts
-        run: bash -n scripts/build-app.sh scripts/render-preview.sh scripts/test-settings.sh scripts/test-bluetooth-bridge.sh
+        run: bash -n scripts/build-app.sh scripts/render-preview.sh scripts/test-settings.sh scripts/test-bluetooth-bridge.sh scripts/test-animation.sh scripts/test-rendering.sh
