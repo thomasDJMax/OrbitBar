@@ -9,11 +9,14 @@ import OrbitBarCore
 /// Observes existing connections only. It never scans, pairs, opens an audio
 /// connection, or changes Bluetooth power.
 @MainActor
-final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelegate {
+final class BluetoothMonitor: NSObject, ObservableObject {
     @Published private(set) var state = BluetoothState()
 
     private var central: CBCentralManager?
+    private var centralObservationSink: BluetoothCentralObservationSink?
+    private var centralLifecycle = ObserverLifecycle()
     private var connectObservation: IOBluetoothUserNotification?
+    private var classicObservationSink: BluetoothClassicObservationSink?
     private var disconnectObservations: [String: IOBluetoothUserNotification] = [:]
     private var connectedEventAddresses = Set<String>()
     private var workspaceObservations: [NSObjectProtocol] = []
@@ -67,12 +70,19 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         }
         ensureConnectObservation()
         if registryObservations == nil {
+            let observation = connectionSession.observationToken
             registryObservations = BluetoothRegistryObservations(
                 onTopologyChange: { [weak self] serviceIDs, removed, time in
-                    Task { @MainActor [weak self] in self?.registryTopologyChanged(serviceIDs: serviceIDs, removed: removed, at: time) }
+                    Task { @MainActor [weak self] in
+                        guard let self, self.connectionSession.acceptsObservation(observation) else { return }
+                        self.registryTopologyChanged(serviceIDs: serviceIDs, removed: removed, at: time)
+                    }
                 },
                 onPropertyChange: { [weak self] serviceID, time in
-                    Task { @MainActor [weak self] in self?.registryPropertiesChanged(serviceID: serviceID, at: time) }
+                    Task { @MainActor [weak self] in
+                        guard let self, self.connectionSession.acceptsObservation(observation) else { return }
+                        self.registryPropertiesChanged(serviceID: serviceID, at: time)
+                    }
                 })
         }
         publishConnectedDevices()
@@ -110,23 +120,34 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         retryRefresh = nil
         invalidateRegistryRead()
         removeConnectionObservations()
-        central?.delegate = nil
-        central = nil
+        removeCentralObservation()
         let center = NSWorkspace.shared.notificationCenter
         for observer in workspaceObservations { center.removeObserver(observer) }
         workspaceObservations.removeAll()
         registryRecords.removeAll()
         batteryUpdatingIDs.removeAll()
+        classicConnectedIDs.removeAll()
         publish(BluetoothState(authorization: state.authorization, power: .unknown))
     }
 
-    nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        Task { @MainActor [weak self] in
-            guard let self, self.isRunning, !self.isSleeping else { return }
-            self.invalidateRegistryRead()
-            self.refresh()
-            self.scheduleShortRetries()
-        }
+    private func centralStateDidChange(state: Int, authorization: Int, at time: Double) {
+        guard isRunning, !isSleeping, centralLifecycle.acceptsEvent(at: time),
+              CBManagerState(rawValue: state) != nil, CBManagerAuthorization(rawValue: authorization) != nil else { return }
+        // Even if on's task arrives before off's, an accepted state callback
+        // must revoke the old device-registration epoch. Read current power only
+        // after the boundary; never let its newer value erase the off event.
+        connectionSession.suspend(serviceIDsByDevice: batterySourcesByDevice())
+        pendingRefresh?.cancel()
+        pendingRefresh = nil
+        retryRefresh?.cancel()
+        retryRefresh = nil
+        invalidateRegistryRead()
+        removeConnectionObservations()
+        registryRecords.removeAll()
+        batteryUpdatingIDs.removeAll()
+        classicConnectedIDs.removeAll()
+        refresh()
+        scheduleShortRetries()
     }
 
     private func start() {
@@ -135,8 +156,9 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification] {
             workspaceObservations.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                let time = ProcessInfo.processInfo.systemUptime
                 Task { @MainActor [weak self] in
-                    guard let self, self.isRunning else { return }
+                    guard let self, self.isRunning, self.connectionSession.acceptsLifecycleTransition(at: time) else { return }
                     if name == NSWorkspace.willSleepNotification { self.suspend() }
                     else { self.resume() }
                 }
@@ -166,14 +188,17 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         retryRefresh = nil
         invalidateRegistryRead()
         removeConnectionObservations()
-        central?.delegate = nil
-        central = nil
+        removeCentralObservation()
         registryRecords.removeAll()
         batteryUpdatingIDs.removeAll()
+        classicConnectedIDs.removeAll()
         publish(BluetoothState(authorization: state.authorization, power: .unknown))
     }
 
     private func resume() {
+        // A wake can be handled before the older sleep task reaches MainActor.
+        // Always revoke the old registrations/tasks before creating new ones.
+        suspend()
         isSleeping = false
         startPolling()
         refresh()
@@ -204,8 +229,23 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
 
     private func ensureCentral() {
         guard central == nil else { return }
-        central = CBCentralManager(delegate: self, queue: .main,
+        let observation = centralLifecycle.token
+        let sink = BluetoothCentralObservationSink { [weak self] state, authorization, time in
+            Task { @MainActor [weak self] in
+                guard let self, self.centralLifecycle.accepts(observation) else { return }
+                self.centralStateDidChange(state: state, authorization: authorization, at: time)
+            }
+        }
+        centralObservationSink = sink
+        central = CBCentralManager(delegate: sink, queue: .main,
                                    options: [CBCentralManagerOptionShowPowerAlertKey: false])
+    }
+
+    private func removeCentralObservation() {
+        centralLifecycle.invalidate()
+        central?.delegate = nil
+        central = nil
+        centralObservationSink = nil
     }
 
     private static func authorization() -> BluetoothAuthorization {
@@ -240,50 +280,63 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
 
     private func ensureConnectObservation() {
         guard connectObservation == nil else { return }
-        connectObservation = IOBluetoothDevice.register(forConnectNotifications: self,
-            selector: #selector(deviceConnected(_:device:)))
+        if classicObservationSink == nil {
+            let observation = connectionSession.observationToken
+            classicObservationSink = BluetoothClassicObservationSink(
+                onConnect: { [weak self] address, time in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.connectionSession.acceptsObservation(observation) else { return }
+                        self.deviceConnected(address: address, at: time)
+                    }
+                },
+                onDisconnect: { [weak self] address, time in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.connectionSession.acceptsObservation(observation) else { return }
+                        self.deviceDisconnected(address: address, at: time)
+                    }
+                })
+        }
+        guard let sink = classicObservationSink else { return }
+        connectObservation = IOBluetoothDevice.register(forConnectNotifications: sink,
+            selector: #selector(BluetoothClassicObservationSink.deviceConnected(_:device:)))
     }
 
-    @objc nonisolated private func deviceConnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
-        let address = device.addressString
-        let time = ProcessInfo.processInfo.systemUptime
-        Task { @MainActor [weak self] in
-            guard let self, self.isRunning, !self.isSleeping else { return }
-            guard let address, let id = RegistryBluetoothReader.normalizedAddress(address),
-                  self.connectionSession.didConnect(id, previousServiceIDs: self.batterySources(for: id), at: time) else { return }
-            self.connectedEventAddresses.insert(address)
-            self.batteryUpdatingIDs.insert(id)
-            self.registryRecords.removeAll { $0.address == id }
-            self.clearDisplayedBattery(for: id)
-            self.invalidateRegistryRead()
-            self.refresh()
-            self.scheduleShortRetries()
-        }
+    private func deviceConnected(address: String?, at time: Double) {
+        guard isRunning, !isSleeping else { return }
+        guard Self.authorization() == .allowed, readPower() == .on else { refresh(); return }
+        guard let address, let id = RegistryBluetoothReader.normalizedAddress(address),
+              connectionSession.didConnect(id, previousServiceIDs: batterySources(for: id), at: time) else { return }
+        connectedEventAddresses.insert(address)
+        batteryUpdatingIDs.insert(id)
+        registryRecords.removeAll { $0.address == id }
+        clearDisplayedBattery(for: id)
+        invalidateRegistryRead()
+        refresh()
+        scheduleShortRetries()
     }
 
-    @objc nonisolated private func deviceDisconnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
-        let address = device.addressString
-        let time = ProcessInfo.processInfo.systemUptime
-        Task { @MainActor [weak self] in
-            guard let self, self.isRunning, !self.isSleeping else { return }
-            guard let address, let id = RegistryBluetoothReader.normalizedAddress(address),
-                  self.connectionSession.didDisconnect(id, serviceIDs: self.connectionSources(for: id),
-                    batteryServiceIDs: self.batterySources(for: id), at: time) else { return }
-            self.connectedEventAddresses.remove(address)
-            self.batteryUpdatingIDs.remove(id)
-            self.registryRecords.removeAll { $0.address == id }
-            self.removeDisplayedDevice(id)
-            self.invalidateRegistryRead()
-            self.refresh()
-            self.scheduleShortRetries()
-        }
+    private func deviceDisconnected(address: String?, at time: Double) {
+        guard isRunning, !isSleeping else { return }
+        guard Self.authorization() == .allowed, readPower() == .on else { refresh(); return }
+        guard let address, let id = RegistryBluetoothReader.normalizedAddress(address),
+              connectionSession.didDisconnect(id, serviceIDs: connectionSources(for: id),
+                batteryServiceIDs: batterySources(for: id), at: time) else { return }
+        connectedEventAddresses.remove(address)
+        batteryUpdatingIDs.remove(id)
+        registryRecords.removeAll { $0.address == id }
+        removeDisplayedDevice(id)
+        invalidateRegistryRead()
+        refresh()
+        scheduleShortRetries()
     }
 
     private func removeConnectionObservations() {
+        connectionSession.invalidateObservations()
         connectObservation?.unregister()
         connectObservation = nil
         for observation in disconnectObservations.values { observation.unregister() }
         disconnectObservations.removeAll()
+        classicObservationSink = nil
         connectedEventAddresses.removeAll()
         registryObservations?.stop()
         registryObservations = nil
@@ -324,9 +377,9 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             guard let address = device.addressString,
                   let id = RegistryBluetoothReader.normalizedAddress(address) else { continue }
             activeIDs.insert(id)
-            if disconnectObservations[id] == nil {
-                disconnectObservations[id] = device.register(forDisconnectNotification: self,
-                    selector: #selector(deviceDisconnected(_:device:)))
+            if disconnectObservations[id] == nil, let sink = classicObservationSink {
+                disconnectObservations[id] = device.register(forDisconnectNotification: sink,
+                    selector: #selector(BluetoothClassicObservationSink.deviceDisconnected(_:device:)))
             }
             let name = device.name ?? "蓝牙设备"
             if !registryReadComplete, !state.devices.contains(where: { $0.id == id }) { batteryUpdatingIDs.insert(id) }
@@ -357,7 +410,9 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     private func batteryReading(for id: String) -> (reading: BluetoothBatteryState, isStale: Bool) {
-        guard let record = RegistryBluetoothReader.preferredRecord(for: id, in: registryRecords),
+        let availableSources = Set(registryRecords.filter { $0.address == id }.compactMap(\.batteryServiceID))
+        let preferredSources = connectionSession.preferredBatteryServiceIDs(for: id, available: availableSources)
+        guard let record = RegistryBluetoothReader.preferredRecord(for: id, in: registryRecords, preferredBatteryServiceIDs: preferredSources),
               let source = record.batteryServiceID, !connectionSession.isBlocked(id) else { return (.init(), false) }
         let currentSession = connectionSession.acceptsBattery(id, serviceIDs: [source])
         return (record.battery, record.battery.hasReading && !currentSession)
@@ -459,7 +514,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             self.registryWorker = nil
             guard Self.authorization() == .allowed, self.readPower() == .on else { return }
             self.registryRecords = records
-            for record in RegistryBluetoothReader.preferredRecords(records) {
+            for record in RegistryBluetoothReader.batteryRecords(records) {
                 if let id = record.address, let source = record.batteryServiceID {
                     self.connectionSession.observeBattery(id, serviceID: source, observation: record.batteryObservation)
                 }
@@ -479,6 +534,45 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
 
     private func publish(_ value: BluetoothState) {
         if value != state { state = value }
+    }
+}
+
+/// A registration owns immutable callback closures for its observation epoch.
+/// An old native callback therefore cannot acquire a new epoch after wake.
+@MainActor
+private final class BluetoothClassicObservationSink: NSObject {
+    nonisolated private let onConnect: @Sendable (String?, Double) -> Void
+    nonisolated private let onDisconnect: @Sendable (String?, Double) -> Void
+
+    init(onConnect: @escaping @Sendable (String?, Double) -> Void,
+         onDisconnect: @escaping @Sendable (String?, Double) -> Void) {
+        self.onConnect = onConnect
+        self.onDisconnect = onDisconnect
+        super.init()
+    }
+
+    @objc nonisolated func deviceConnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+        onConnect(device.addressString, ProcessInfo.processInfo.systemUptime)
+    }
+
+    @objc nonisolated func deviceDisconnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+        onDisconnect(device.addressString, ProcessInfo.processInfo.systemUptime)
+    }
+}
+
+/// The central watch survives ordinary off/on transitions, while sleep/stop
+/// replace its immutable epoch. Preserve state/auth/time at native delivery.
+@MainActor
+private final class BluetoothCentralObservationSink: NSObject, CBCentralManagerDelegate {
+    nonisolated private let onState: @Sendable (Int, Int, Double) -> Void
+
+    init(onState: @escaping @Sendable (Int, Int, Double) -> Void) {
+        self.onState = onState
+        super.init()
+    }
+
+    nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        onState(central.state.rawValue, CBManager.authorization.rawValue, ProcessInfo.processInfo.systemUptime)
     }
 }
 

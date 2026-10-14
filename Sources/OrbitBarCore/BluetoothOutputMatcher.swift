@@ -22,6 +22,13 @@ public enum BluetoothOutputMatcher {
             return candidates.count == 1 ? candidates.first : nil
         }
 
+        // Once an opaque HAL route has a known accessory, losing that accessory
+        // cannot transfer the unchanged route to another device with its name.
+        if let associated = audio.bluetoothDeviceID {
+            let candidates = devices.filter { BluetoothAddress.normalize($0.id) == associated }
+            return candidates.count == 1 ? candidates.first : nil
+        }
+
         // Names are a fallback only when exact, nonempty, and unique among
         // connected devices. Substrings and same-name accessories are ambiguous.
         let name = normalizedName(audio.outputName)

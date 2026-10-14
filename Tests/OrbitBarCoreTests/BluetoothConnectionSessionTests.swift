@@ -120,6 +120,97 @@ final class BluetoothConnectionSessionTests: XCTestCase {
         XCTAssertTrue(hid.didDisconnect(headphones, serviceIDs: [20], at: 13))
     }
 
+    func testQueuedNativePayloadFromBeforeSleepIsRejectedAfterWake() {
+        var session = BluetoothConnectionSession()
+        session.didConnect(headphones, at: 10)
+        let beforeSleep = session.observationToken
+        session.suspend(serviceIDsByDevice: [headphones: [10]])
+        let afterWake = session.observationToken
+        XCTAssertFalse(session.acceptsObservation(beforeSleep))
+        XCTAssertTrue(session.acceptsObservation(afterWake))
+        // Repeated data reads and individual connections do not change the
+        // epoch of the still-registered global connection notification.
+        _ = session.beginRead()
+        session.didConnect(headphones, at: 20)
+        session.batteryPropertiesChanged(serviceID: 10, at: 21)
+        XCTAssertTrue(session.acceptsObservation(afterWake))
+    }
+
+    func testRevokedPowerPermissionOrStoppedRegistrationRejectsItsQueuedPayload() {
+        var session = BluetoothConnectionSession()
+        let previousRegistration = session.observationToken
+        let inFlightRead = session.beginRead()
+        session.invalidateObservations()
+        XCTAssertFalse(session.acceptsObservation(previousRegistration))
+        XCTAssertFalse(session.accepts(inFlightRead))
+        XCTAssertTrue(session.acceptsObservation(session.observationToken))
+    }
+
+    func testOldSleepTaskCannotOverrideTheNewerWakeTransition() {
+        var session = BluetoothConnectionSession()
+        XCTAssertTrue(session.acceptsLifecycleTransition(at: 10))
+        XCTAssertTrue(session.acceptsLifecycleTransition(at: 20))
+        XCTAssertFalse(session.acceptsLifecycleTransition(at: 15))
+    }
+
+    func testAChangedLowIDBatterySourceKeepsPriorityOverAnUnchangedHighIDSource() {
+        var session = BluetoothConnectionSession()
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 200, observation: .init(overall: .percent(80)))
+        session.observeBattery(headphones, serviceID: 100, observation: .init(overall: .percent(60)))
+        XCTAssertEqual(session.preferredBatteryServiceIDs(for: headphones, available: [100, 200]), [100, 200])
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 100, observation: .init(overall: .percent(59)))
+        session.observeBattery(headphones, serviceID: 200, observation: .init(overall: .percent(80)))
+        XCTAssertEqual(session.preferredBatteryServiceIDs(for: headphones, available: [100, 200]), [100])
+        // Repeated unchanged sampling must not oscillate back to source 200.
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 200, observation: .init(overall: .percent(80)))
+        session.observeBattery(headphones, serviceID: 100, observation: .init(overall: .percent(59)))
+        XCTAssertEqual(session.preferredBatteryServiceIDs(for: headphones, available: [100, 200]), [100])
+    }
+
+    func testInvalidCompleteObservationAdvancesItsSourceWithoutFillingFromOldData() {
+        var session = BluetoothConnectionSession()
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 200, observation: .init(left: .percent(80), right: .percent(81)))
+        session.observeBattery(headphones, serviceID: 100, observation: .init(left: .percent(60), right: .percent(61)))
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 200, observation: .init(left: .percent(80), right: .percent(81)))
+        session.observeBattery(headphones, serviceID: 100, observation: .init(left: .invalid, right: .absent))
+        XCTAssertEqual(session.preferredBatteryServiceIDs(for: headphones, available: [100, 200]), [100])
+    }
+
+    func testRemovedBatterySourceFallsBackToTheAvailableSource() {
+        var session = BluetoothConnectionSession()
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 200, observation: .init(overall: .percent(80)))
+        session.observeBattery(headphones, serviceID: 100, observation: .init(overall: .percent(60)))
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 100, observation: .init(overall: .percent(59)))
+        XCTAssertEqual(session.preferredBatteryServiceIDs(for: headphones, available: [100, 200]), [100])
+        XCTAssertEqual(session.preferredBatteryServiceIDs(for: headphones, available: [200]), [200])
+        XCTAssertTrue(session.preferredBatteryServiceIDs(for: headphones, available: []).isEmpty)
+    }
+
+    func testConnectionAndSleepBoundariesClearBatterySourcePriority() {
+        var session = BluetoothConnectionSession()
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 200, observation: .init(overall: .percent(80)))
+        session.observeBattery(headphones, serviceID: 100, observation: .init(overall: .percent(60)))
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 100, observation: .init(overall: .percent(59)))
+        session.didDisconnect(headphones, serviceIDs: [10], batteryServiceIDs: [100, 200])
+        XCTAssertTrue(session.preferredBatteryServiceIDs(for: headphones, available: [100, 200]).isEmpty)
+        session.didConnect(headphones)
+        XCTAssertTrue(session.preferredBatteryServiceIDs(for: headphones, available: [100, 200]).isEmpty)
+        _ = session.beginRead()
+        session.observeBattery(headphones, serviceID: 300, observation: .init(overall: .percent(70)))
+        XCTAssertEqual(session.preferredBatteryServiceIDs(for: headphones, available: [100, 200, 300]), [300])
+        session.suspend(serviceIDsByDevice: [headphones: [300]])
+        XCTAssertTrue(session.preferredBatteryServiceIDs(for: headphones, available: [100, 200, 300]).isEmpty)
+    }
+
     func testSameAddressReconnectRequiresFreshBatteryObservation() {
         var session = BluetoothConnectionSession()
         session.observeBattery(headphones, serviceID: 10, observation: .init(overall: .percent(90)))

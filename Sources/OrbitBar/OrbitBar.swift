@@ -222,7 +222,8 @@ final class OrbitBarDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate
         else if let percent = snapshot.battery.percent { battery = "电量 \(percent)%" }
         else { battery = "电量暂不可用" }
         let network = snapshot.network.kind == .offline ? "网络未连接" : snapshot.network.name ?? "网络已连接"
-        let audio = snapshot.audio.isMuted ? "已静音" : snapshot.audio.canSetVolume
+        let audio = snapshot.audio.outputKind == .unavailable ? "音量暂不可用"
+            : snapshot.audio.isMuted ? "已静音" : snapshot.audio.canSetVolume
             ? "音量 \(Int(snapshot.audio.volume * 100))%" : "音量由输出设备控制"
         let output = snapshot.audio.outputKind == .unavailable ? "暂无可用输出设备"
             : "\(snapshot.audio.outputKind.displayName)：\(snapshot.audio.outputName)"

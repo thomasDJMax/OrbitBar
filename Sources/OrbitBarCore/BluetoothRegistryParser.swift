@@ -180,19 +180,59 @@ public enum BluetoothRegistryParser {
             batteryObservation: batteryObservation, isLiveHID: leaf.isHIDDevice && leaf.isBluetoothTransport)
     }
 
-    public static func preferredRecord(for address: String, in records: [BluetoothRegistryRecord]) -> BluetoothRegistryRecord? {
+    public static func preferredRecord(for address: String, in records: [BluetoothRegistryRecord],
+                                       preferredBatteryServiceIDs: Set<UInt64> = []) -> BluetoothRegistryRecord? {
         guard let canonical = BluetoothAddress.normalize(address) else { return nil }
-        return records.filter { $0.address == canonical }.max { lhs, rhs in
-            let left = [lhs.batteryObservation.hasObservation ? 1 : 0, lhs.isLiveHID ? 1 : 0,
-                        lhs.addressEvidence.rawValue, lhs.batteryObservation.componentObservationCount]
-            let right = [rhs.batteryObservation.hasObservation ? 1 : 0, rhs.isLiveHID ? 1 : 0,
-                         rhs.addressEvidence.rawValue, rhs.batteryObservation.componentObservationCount]
-            if left != right { return left.lexicographicallyPrecedes(right) }
-            return lhs.serviceID < rhs.serviceID
+        var selected = records.filter { $0.address.flatMap(BluetoothAddress.normalize) == canonical }.max { lhs, rhs in
+            precedes(lhs, rhs, preferredBatteryServiceIDs: preferredBatteryServiceIDs)
+        }
+        selected?.address = canonical
+        return selected
+    }
+
+    public static func preferredRecords(_ records: [BluetoothRegistryRecord],
+                                        preferredBatteryServiceIDs: Set<UInt64> = []) -> [BluetoothRegistryRecord] {
+        Set(records.compactMap { $0.address.flatMap(BluetoothAddress.normalize) }).sorted().compactMap {
+            preferredRecord(for: $0, in: records, preferredBatteryServiceIDs: preferredBatteryServiceIDs)
         }
     }
 
-    public static func preferredRecords(_ records: [BluetoothRegistryRecord]) -> [BluetoothRegistryRecord] {
-        Set(records.compactMap(\.address)).sorted().compactMap { preferredRecord(for: $0, in: records) }
+    /// One complete observation per confirmed address/source in an accepted
+    /// batch. Observing only the display winner would hide other source updates
+    /// and keep a genuinely updated source quarantined after reconnect.
+    public static func batteryRecords(_ records: [BluetoothRegistryRecord]) -> [BluetoothRegistryRecord] {
+        var sources: [BatterySource: BluetoothRegistryRecord] = [:]
+        for var record in records {
+            guard let address = record.address.flatMap(BluetoothAddress.normalize),
+                  let serviceID = record.batteryServiceID, record.batteryObservation.hasObservation else { continue }
+            record.address = address
+            let key = BatterySource(address: address, serviceID: serviceID)
+            if let existing = sources[key], !precedes(existing, record, preferredBatteryServiceIDs: []) { continue }
+            sources[key] = record
+        }
+        return sources.keys.sorted { lhs, rhs in
+            lhs.address == rhs.address ? lhs.serviceID < rhs.serviceID : lhs.address < rhs.address
+        }.compactMap { sources[$0] }
+    }
+
+    private struct BatterySource: Hashable {
+        let address: String
+        let serviceID: UInt64
+    }
+
+    private static func precedes(_ lhs: BluetoothRegistryRecord, _ rhs: BluetoothRegistryRecord,
+                                 preferredBatteryServiceIDs: Set<UInt64>) -> Bool {
+        // Only the connection/session owner supplies positive freshness proof.
+        // A registry entry ID or more populated fields never establish freshness.
+        let leftFresh = lhs.batteryObservation.hasObservation && lhs.batteryServiceID.map(preferredBatteryServiceIDs.contains) == true
+        let rightFresh = rhs.batteryObservation.hasObservation && rhs.batteryServiceID.map(preferredBatteryServiceIDs.contains) == true
+        let left = [leftFresh ? 1 : 0, lhs.batteryObservation.hasObservation ? 1 : 0,
+                    lhs.isLiveHID ? 1 : 0, lhs.addressEvidence.rawValue,
+                    lhs.batteryObservation.componentObservationCount]
+        let right = [rightFresh ? 1 : 0, rhs.batteryObservation.hasObservation ? 1 : 0,
+                     rhs.isLiveHID ? 1 : 0, rhs.addressEvidence.rawValue,
+                     rhs.batteryObservation.componentObservationCount]
+        if left != right { return left.lexicographicallyPrecedes(right) }
+        return lhs.serviceID < rhs.serviceID
     }
 }

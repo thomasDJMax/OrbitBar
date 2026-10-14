@@ -49,10 +49,13 @@ public struct AudioState: Equatable, Sendable {
     public var outputUID: String?
     public var outputIdentifier: String?
     public var outputKind: AudioOutputKind
+    /// An accessory associated with this exact HAL route, not a HAL UID guess.
+    public var bluetoothDeviceID: String?
     public init(volume: Double = 0, isMuted: Bool = false, canSetVolume: Bool = false,
                 canSetMute: Bool? = nil, outputName: String = "未检测到输出设备",
                 outputDeviceID: UInt32? = nil, outputUID: String? = nil,
-                outputIdentifier: String? = nil, outputKind: AudioOutputKind = .unavailable) {
+                outputIdentifier: String? = nil, outputKind: AudioOutputKind = .unavailable,
+                bluetoothDeviceID: String? = nil) {
         self.volume = min(1, max(0, volume.isFinite ? volume : 0))
         self.isMuted = isMuted
         self.canSetVolume = canSetVolume
@@ -62,6 +65,7 @@ public struct AudioState: Equatable, Sendable {
         self.outputUID = outputUID
         self.outputIdentifier = outputIdentifier
         self.outputKind = outputKind
+        self.bluetoothDeviceID = bluetoothDeviceID.flatMap(BluetoothAddress.normalize)
     }
     public var litDots: Int {
         guard !isMuted, volume > 0 else { return 0 }

@@ -4,8 +4,10 @@ public struct BluetoothConnectionSession: Sendable {
     public struct ReadToken: Equatable, Sendable {
         fileprivate let revision: UInt64
     }
+    public typealias ObservationToken = ObserverLifecycle.Token
 
     private var revision: UInt64 = 0
+    private var observationScope = ObserverLifecycle()
     private var blocked = Set<String>()
     private var observedDisconnected = Set<String>()
     private var confirmedClassicConnections = Set<String>()
@@ -14,8 +16,25 @@ public struct BluetoothConnectionSession: Sendable {
     private var quarantinedBatteryServices: [String: Set<UInt64>] = [:]
     private var lastEventAt: [String: Double] = [:]
     private var sessionBatteryObservations: [String: [UInt64: BluetoothRegistryBatteryObservation]] = [:]
+    private var batteryChangeRevisions: [String: [UInt64: UInt64]] = [:]
 
     public init() {}
+
+    public var observationToken: ObservationToken { observationScope.token }
+    public func acceptsObservation(_ token: ObservationToken) -> Bool { observationScope.accepts(token) }
+
+    /// Event payloads already queued by an old native subscription must not
+    /// enter a later wake/power/permission epoch.
+    public mutating func invalidateObservations() {
+        observationScope.invalidate()
+        invalidateReads()
+    }
+
+    /// Workspace notifications also hop asynchronously to MainActor. Preserve
+    /// their original ordering when an older sleep task executes after wake.
+    public mutating func acceptsLifecycleTransition(at time: Double) -> Bool {
+        observationScope.acceptsEvent(at: time)
+    }
 
     public var disconnectedDeviceIDs: Set<String> { blocked }
     public var quarantinedServiceIDs: Set<UInt64> {
@@ -43,6 +62,7 @@ public struct BluetoothConnectionSession: Sendable {
         disconnectedServices[id, default: []].formUnion(serviceIDs)
         quarantinedBatteryServices[id, default: []].formUnion(batteryServiceIDs ?? serviceIDs)
         sessionBatteryObservations[id] = nil
+        batteryChangeRevisions[id] = nil
         invalidateReads()
         return true
     }
@@ -59,6 +79,7 @@ public struct BluetoothConnectionSession: Sendable {
         disconnectedServices[id] = nil
         quarantinedBatteryServices[id, default: []].formUnion(previousServiceIDs)
         sessionBatteryObservations[id] = nil
+        batteryChangeRevisions[id] = nil
         invalidateReads()
         return true
     }
@@ -114,6 +135,15 @@ public struct BluetoothConnectionSession: Sendable {
         return previous.isDisjoint(with: serviceIDs)
     }
 
+    /// Prefer the most recently changed complete source among currently
+    /// available, current-session sources. Unchanged reads do not gain priority.
+    public func preferredBatteryServiceIDs(for id: String, available: Set<UInt64>) -> Set<UInt64> {
+        let fresh = available.filter { acceptsBattery(id, serviceIDs: [$0]) }
+        guard let changes = batteryChangeRevisions[id],
+              let latest = fresh.compactMap({ changes[$0] }).max() else { return fresh }
+        return fresh.filter { changes[$0] == latest }
+    }
+
     /// General IOKit interest can report any property change, including a name.
     /// Mark the source dirty; the next complete observation must prove a battery
     /// change between accepted current-session reads before old values can be
@@ -132,11 +162,15 @@ public struct BluetoothConnectionSession: Sendable {
             // that changed while disconnected is still only a previous report.
             guard let previous = sessionBatteryObservations[id]?[serviceID] else {
                 sessionBatteryObservations[id, default: [:]][serviceID] = observation
+                batteryChangeRevisions[id, default: [:]][serviceID] = revision
                 return
             }
             guard previous != observation else { return }
             quarantinedBatteryServices[id]?.remove(serviceID)
             if quarantinedBatteryServices[id]?.isEmpty == true { quarantinedBatteryServices[id] = nil }
+        }
+        if sessionBatteryObservations[id]?[serviceID] != observation {
+            batteryChangeRevisions[id, default: [:]][serviceID] = revision
         }
         sessionBatteryObservations[id, default: [:]][serviceID] = observation
     }
@@ -146,12 +180,13 @@ public struct BluetoothConnectionSession: Sendable {
             quarantinedBatteryServices[id, default: []].formUnion(serviceIDs)
         }
         sessionBatteryObservations.removeAll()
+        batteryChangeRevisions.removeAll()
         pendingConnectConfirmation.removeAll()
         confirmedClassicConnections.removeAll()
         // The wake boundary is a fresh system observation, unlike the first
         // stale callback immediately after a disconnect.
         observedDisconnected.formUnion(blocked)
-        invalidateReads()
+        invalidateObservations()
     }
 
     private mutating func acceptsEvent(_ id: String, at time: Double?) -> Bool {

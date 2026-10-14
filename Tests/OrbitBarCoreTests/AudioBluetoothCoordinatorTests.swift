@@ -201,4 +201,82 @@ final class AudioBluetoothCoordinatorTests: XCTestCase {
         XCTAssertTrue(AudioBluetoothCoordinator.permitsControl(audio: route(first), bluetooth: state([])))
         XCTAssertTrue(AudioBluetoothCoordinator.permitsControl(audio: route(first), bluetooth: BluetoothState(authorization: .denied)))
     }
+
+    func testOpaqueUIDDisconnectClearsThePreviouslyMatchedRoute() {
+        var raw = route(first)
+        raw.outputUID = "opaque-output"
+        raw.isMuted = true
+        var coordinator = AudioBluetoothCoordinator(audio: raw, bluetooth: state([first]))
+        let disconnected = BluetoothState(authorization: .allowed, power: .on,
+                                          disconnectedDeviceIDs: [first.id])
+        let change = coordinator.updateBluetooth(disconnected)
+        XCTAssertEqual(change.audio.outputKind, .unavailable)
+        XCTAssertEqual(change.audio.litDots, 0)
+        XCTAssertFalse(change.audio.canSetVolume)
+        XCTAssertFalse(change.audio.canSetMute)
+        XCTAssertFalse(change.audio.isMuted)
+        XCTAssertEqual(coordinator.updateAudio(raw).audio.outputKind, .unavailable)
+        XCTAssertTrue(coordinator.updateBluetooth(state([first])).audio.canSetVolume)
+    }
+
+    func testSameNameReplacementCannotTakeOverAnUnchangedOpaqueRoute() {
+        var raw = route(first)
+        raw.outputUID = "opaque-output"
+        var coordinator = AudioBluetoothCoordinator(audio: raw, bluetooth: state([first]))
+        let absent = coordinator.updateBluetooth(state([second]))
+        XCTAssertTrue(absent.audio.canSetVolume, "List absence is not a disconnect.")
+        XCTAssertNil(BluetoothOutputMatcher.currentDevice(audio: absent.audio, devices: [second]),
+                     "A same-name accessory must not inherit a route previously matched to A.")
+        let disconnected = BluetoothState(authorization: .allowed, power: .on, devices: [second],
+                                          disconnectedDeviceIDs: [first.id])
+        XCTAssertEqual(coordinator.updateBluetooth(disconnected).audio.outputKind, .unavailable)
+        var changedRoute = route(second, halID: 43)
+        changedRoute.outputUID = "another-opaque-output"
+        let changed = coordinator.updateAudio(changedRoute)
+        XCTAssertTrue(changed.outputIdentityChanged)
+        XCTAssertTrue(changed.audio.canSetVolume)
+        XCTAssertEqual(BluetoothOutputMatcher.currentDevice(audio: changed.audio, devices: [second])?.id, second.id)
+    }
+
+    func testNativeOpaqueControlCheckUsesFreshIdentityAndStoredAssociation() {
+        var raw = route(first)
+        raw.outputUID = "opaque-output"
+        var coordinator = AudioBluetoothCoordinator(audio: raw, bluetooth: state([first]))
+        _ = coordinator.updateBluetooth(BluetoothState(authorization: .allowed, power: .on, devices: [second],
+                                                    disconnectedDeviceIDs: [first.id]))
+        XCTAssertFalse(coordinator.permitsControl(audio: raw))
+        for field in ["id", "uid", "route"] {
+            var changed = raw
+            if field == "id" { changed.outputDeviceID = 43 }
+            if field == "uid" { changed.outputUID = "a-new-opaque-output" }
+            if field == "route" { changed.outputIdentifier = "a-new-route" }
+            XCTAssertTrue(coordinator.permitsControl(audio: changed), field)
+            let update = coordinator.updateAudio(changed)
+            XCTAssertEqual(update.audio.bluetoothDeviceID, second.id, field)
+            // Restoring A establishes a new actual route boundary for each case.
+            _ = coordinator.updateBluetooth(state([first]))
+            _ = coordinator.updateAudio(raw)
+            _ = coordinator.updateBluetooth(BluetoothState(authorization: .allowed, power: .on, devices: [second],
+                                                        disconnectedDeviceIDs: [first.id]))
+        }
+    }
+
+    func testOpaqueBindingPreservesKnownIdentityAfterRenameAndDoesNotInventDisconnect() {
+        var raw = route(first)
+        raw.outputUID = "opaque-output"
+        var coordinator = AudioBluetoothCoordinator(audio: raw, bluetooth: state([first]))
+        var renamed = first
+        renamed.name = "Renamed Headphones"
+        let updated = coordinator.updateBluetooth(state([renamed, second]))
+        XCTAssertEqual(updated.audio.bluetoothDeviceID, first.id)
+        XCTAssertEqual(BluetoothOutputMatcher.currentDevice(audio: updated.audio, devices: [renamed, second])?.id, first.id)
+        XCTAssertTrue(coordinator.updateBluetooth(state([])).audio.canSetVolume)
+        XCTAssertTrue(coordinator.permitsControl(audio: raw))
+        XCTAssertTrue(coordinator.updateBluetooth(BluetoothState(authorization: .denied)).audio.canSetVolume)
+        coordinator.setSleeping(true)
+        XCTAssertFalse(coordinator.permitsControl(audio: raw))
+        coordinator.setSleeping(false)
+        coordinator.stop()
+        XCTAssertFalse(coordinator.permitsControl(audio: raw))
+    }
 }

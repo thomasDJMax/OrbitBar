@@ -200,4 +200,102 @@ final class BluetoothRegistryParserTests: XCTestCase {
         XCTAssertNil(BluetoothRegistryParser.preferredRecord(for: firstAddress, in: [other]))
         XCTAssertEqual(BluetoothRegistryParser.preferredRecords([other]).map(\.address), [secondAddress])
     }
+
+    func testFreshLowerIDSourceWinsOverHigherIDCachedSourceWithoutChangingFallback() throws {
+        let old = try XCTUnwrap(BluetoothRegistryParser.parse(nodes: [node(200,
+            ["DeviceAddress": firstAddress, "BatteryPercent": 80, "Transport": "Bluetooth"], hid: true)]))
+        let fresh = try XCTUnwrap(BluetoothRegistryParser.parse(nodes: [node(100,
+            ["DeviceAddress": firstAddress, "BatteryPercent": 59, "Transport": "Bluetooth"], hid: true)]))
+        for records in [[old, fresh], [fresh, old]] {
+            XCTAssertEqual(BluetoothRegistryParser.preferredRecord(for: firstAddress, in: records)?.batteryServiceID, 200)
+            let selected = try XCTUnwrap(BluetoothRegistryParser.preferredRecord(for: firstAddress, in: records,
+                preferredBatteryServiceIDs: [100]))
+            XCTAssertEqual(selected.batteryServiceID, 100)
+            XCTAssertEqual(selected.battery.overall, 59)
+            XCTAssertEqual(BluetoothRegistryParser.preferredRecords(records, preferredBatteryServiceIDs: [100]), [selected])
+        }
+    }
+
+    func testFreshPartialAndInvalidSourcesNeverFillFromAnOlderCompleteSource() throws {
+        let old = try XCTUnwrap(BluetoothRegistryParser.parse(nodes: [node(200,
+            ["DeviceAddress": firstAddress, "BatteryPercentLeft": 80, "BatteryPercentRight": 75,
+             "BatteryPercentCase": 45, "Transport": "Bluetooth"], hid: true)]))
+        let partial = try XCTUnwrap(BluetoothRegistryParser.parse(nodes: [node(100,
+            ["DeviceAddress": firstAddress, "BatteryPercentLeft": 0])]))
+        let invalid = try XCTUnwrap(BluetoothRegistryParser.parse(nodes: [node(110,
+            ["DeviceAddress": firstAddress, "BatteryPercentLeft": 255])]))
+        let selectedPartial = try XCTUnwrap(BluetoothRegistryParser.preferredRecord(for: firstAddress, in: [old, partial],
+            preferredBatteryServiceIDs: [100]))
+        XCTAssertEqual(selectedPartial.battery, BluetoothBatteryState(left: 0))
+        let selectedInvalid = try XCTUnwrap(BluetoothRegistryParser.preferredRecord(for: firstAddress, in: [old, invalid],
+            preferredBatteryServiceIDs: [110]))
+        XCTAssertEqual(selectedInvalid.batteryObservation.left, .invalid)
+        XCTAssertFalse(selectedInvalid.battery.hasReading)
+    }
+
+    func testBatteryRecordsObserveAllSourcesOnceAndCanonicalizeAddresses() {
+        let firstLeaf = BluetoothRegistryRecord(serviceID: 10, batteryServiceID: 100,
+            address: firstAddress.lowercased(), batteryObservation: .init(left: .percent(62)))
+        let duplicateSourceLeaf = BluetoothRegistryRecord(serviceID: 20, batteryServiceID: 100,
+            address: firstAddress, batteryObservation: .init(right: .percent(77)))
+        let anotherSource = BluetoothRegistryRecord(serviceID: 30, batteryServiceID: 200,
+            address: firstAddress, batteryObservation: .init(caseLevel: .percent(0)))
+        let otherDevice = BluetoothRegistryRecord(serviceID: 40, batteryServiceID: 100,
+            address: secondAddress, batteryObservation: .init(overall: .percent(80)))
+        let noObservation = BluetoothRegistryRecord(serviceID: 50, batteryServiceID: 300,
+            address: firstAddress)
+        let noSource = BluetoothRegistryRecord(serviceID: 60,
+            address: firstAddress, batteryObservation: .init(overall: .percent(99)))
+        let records = [firstLeaf, duplicateSourceLeaf, anotherSource, otherDevice, noObservation, noSource]
+        let forward = BluetoothRegistryParser.batteryRecords(records)
+        XCTAssertEqual(forward, BluetoothRegistryParser.batteryRecords(Array(records.reversed())))
+        XCTAssertEqual(forward.map(\.address), [firstAddress, firstAddress, secondAddress])
+        XCTAssertEqual(forward.compactMap(\.batteryServiceID), [100, 200, 100])
+        XCTAssertEqual(forward[0].battery, BluetoothBatteryState(right: 77),
+                       "Two leaves sharing a source must produce one complete observation, not combined ears.")
+        XCTAssertEqual(forward[1].battery.caseLevel, 0)
+    }
+
+    func testSameSourceInvalidDuplicateRemainsWholeAndOrderIndependent() {
+        let partial = BluetoothRegistryRecord(serviceID: 10, batteryServiceID: 100,
+            address: firstAddress, batteryObservation: .init(right: .percent(77)))
+        let invalid = BluetoothRegistryRecord(serviceID: 20, batteryServiceID: 100,
+            address: firstAddress, batteryObservation: .init(left: .invalid))
+        for records in [[partial, invalid], [invalid, partial]] {
+            let observations = BluetoothRegistryParser.batteryRecords(records)
+            XCTAssertEqual(observations.count, 1)
+            XCTAssertEqual(observations[0].batteryObservation, .init(left: .invalid))
+            XCTAssertFalse(observations[0].battery.hasReading)
+        }
+    }
+
+    func testUpdatedPreviouslyUnselectedSourceCanLeaveReconnectQuarantine() throws {
+        func record(_ source: UInt64, _ level: Int) -> BluetoothRegistryRecord {
+            BluetoothRegistryRecord(serviceID: source, batteryServiceID: source, address: firstAddress,
+                                    batteryObservation: .init(overall: .percent(level)))
+        }
+        var session = BluetoothConnectionSession()
+        session.didDisconnect(firstAddress, batteryServiceIDs: [100, 200])
+        session.didConnect(firstAddress, previousServiceIDs: [100, 200])
+        let initial = [record(100, 60), record(200, 80)]
+        for observation in BluetoothRegistryParser.batteryRecords(initial) {
+            session.observeBattery(firstAddress, serviceID: try XCTUnwrap(observation.batteryServiceID),
+                                   observation: observation.batteryObservation)
+        }
+        let updated = [record(100, 59), record(200, 80)]
+        for observation in BluetoothRegistryParser.batteryRecords(updated) {
+            session.observeBattery(firstAddress, serviceID: try XCTUnwrap(observation.batteryServiceID),
+                                   observation: observation.batteryObservation)
+        }
+        let freshIDs = Set(updated.compactMap { observation -> UInt64? in
+            guard let source = observation.batteryServiceID,
+                  session.acceptsBattery(firstAddress, serviceIDs: [source]) else { return nil }
+            return source
+        })
+        XCTAssertEqual(freshIDs, [100])
+        let selected = try XCTUnwrap(BluetoothRegistryParser.preferredRecord(for: firstAddress, in: updated,
+            preferredBatteryServiceIDs: freshIDs))
+        XCTAssertEqual(selected.batteryServiceID, 100)
+        XCTAssertEqual(selected.battery.overall, 59)
+    }
 }

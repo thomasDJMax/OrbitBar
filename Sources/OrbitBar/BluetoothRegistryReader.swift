@@ -14,6 +14,9 @@ enum RegistryBluetoothReader {
     static func read(knownConnectedAddresses: Set<String> = []) -> [RegistryBluetoothRecord] {
         var records: [RegistryBluetoothRecord] = []
         var visited = Set<UInt64>()
+        // This cache exists for one read only. Shared providers must contribute
+        // the same property snapshot when several leaf services reference them.
+        var nodeCache: [UInt64: BluetoothRegistryNode] = [:]
         for className in matchingClasses {
             guard !Task.isCancelled else { break }
             var iterator: io_iterator_t = IO_OBJECT_NULL
@@ -26,7 +29,8 @@ enum RegistryBluetoothReader {
                 defer { IOObjectRelease(service) }
                 guard let identifier = serviceID(service), visited.insert(identifier).inserted,
                       let record = readRecord(service, identifier: identifier,
-                                              knownConnectedAddresses: knownConnectedAddresses) else { continue }
+                                              knownConnectedAddresses: knownConnectedAddresses,
+                                              nodeCache: &nodeCache) else { continue }
                 records.append(record)
             }
         }
@@ -35,17 +39,26 @@ enum RegistryBluetoothReader {
 
     static func normalizedAddress(_ value: String) -> String? { BluetoothAddress.normalize(value) }
 
-    static func preferredRecord(for address: String, in records: [RegistryBluetoothRecord]) -> RegistryBluetoothRecord? {
-        BluetoothRegistryParser.preferredRecord(for: address, in: records)
+    static func preferredRecord(for address: String, in records: [RegistryBluetoothRecord],
+                                preferredBatteryServiceIDs: Set<UInt64> = []) -> RegistryBluetoothRecord? {
+        BluetoothRegistryParser.preferredRecord(for: address, in: records,
+                                                preferredBatteryServiceIDs: preferredBatteryServiceIDs)
     }
 
-    static func preferredRecords(_ records: [RegistryBluetoothRecord]) -> [RegistryBluetoothRecord] {
-        BluetoothRegistryParser.preferredRecords(records)
+    static func preferredRecords(_ records: [RegistryBluetoothRecord],
+                                 preferredBatteryServiceIDs: Set<UInt64> = []) -> [RegistryBluetoothRecord] {
+        BluetoothRegistryParser.preferredRecords(records, preferredBatteryServiceIDs: preferredBatteryServiceIDs)
+    }
+
+    static func batteryRecords(_ records: [RegistryBluetoothRecord]) -> [RegistryBluetoothRecord] {
+        BluetoothRegistryParser.batteryRecords(records)
     }
 
     private static func readRecord(_ service: io_service_t, identifier: UInt64,
-                                   knownConnectedAddresses: Set<String>) -> RegistryBluetoothRecord? {
-        guard let leaf = node(service, identifier: identifier, knownConnectedAddresses: knownConnectedAddresses) else { return nil }
+                                   knownConnectedAddresses: Set<String>,
+                                   nodeCache: inout [UInt64: BluetoothRegistryNode]) -> RegistryBluetoothRecord? {
+        guard let leaf = node(service, identifier: identifier, knownConnectedAddresses: knownConnectedAddresses,
+                              nodeCache: &nodeCache) else { return nil }
         var nodes = [leaf]
         // Read bounded, direct providers. Keep each node's identity and properties
         // separate so controllers and other devices cannot supply false battery.
@@ -58,7 +71,8 @@ enum RegistryBluetoothReader {
             if parent != service { IOObjectRelease(parent) }
             parent = next
             guard let id = serviceID(parent), let provider = node(parent, identifier: id,
-                                                                 knownConnectedAddresses: knownConnectedAddresses),
+                                                                 knownConnectedAddresses: knownConnectedAddresses,
+                                                                 nodeCache: &nodeCache),
                   provider.isDeviceProvider, !provider.hasOtherTransport else { break }
             nodes.append(provider)
             if provider.address == .invalid || provider.address == .conflicting { break }
@@ -67,14 +81,19 @@ enum RegistryBluetoothReader {
     }
 
     private static func node(_ service: io_registry_entry_t, identifier: UInt64,
-                             knownConnectedAddresses: Set<String>) -> BluetoothRegistryNode? {
+                             knownConnectedAddresses: Set<String>,
+                             nodeCache: inout [UInt64: BluetoothRegistryNode]) -> BluetoothRegistryNode? {
+        guard !Task.isCancelled else { return nil }
+        if let cached = nodeCache[identifier] { return cached }
         var raw: Unmanaged<CFMutableDictionary>?
         guard IORegistryEntryCreateCFProperties(service, &raw, kCFAllocatorDefault, 0) == KERN_SUCCESS,
               let properties = raw?.takeRetainedValue() as? [String: Any] else { return nil }
-        return BluetoothRegistryNode(serviceID: identifier, properties: properties,
+        let value = BluetoothRegistryNode(serviceID: identifier, properties: properties,
             isDeviceProvider: matchingClasses.contains { IOObjectConformsTo(service, $0) != 0 },
             isHIDDevice: IOObjectConformsTo(service, "IOHIDDevice") != 0,
             knownConnectedAddresses: knownConnectedAddresses)
+        nodeCache[identifier] = value
+        return value
     }
 
     private static func serviceID(_ service: io_registry_entry_t) -> UInt64? {

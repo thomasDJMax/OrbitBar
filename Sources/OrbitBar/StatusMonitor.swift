@@ -28,6 +28,7 @@ final class StatusMonitor: ObservableObject {
     private var isRunning = false
     private var hasStopped = false
     private var isSleeping = false
+    private var lifecycle = ObserverLifecycle()
     private var pendingAudioRefresh: Task<Void, Never>?
     private var outputRefreshRetries: Task<Void, Never>?
     private var outputRetryPlan = AudioOutputRetryPlan()
@@ -170,8 +171,9 @@ final class StatusMonitor: ObservableObject {
         let route = AudioHardware.readRoute(device: device)
         let expected = expectedDeviceID ?? snapshot.audio.outputDeviceID
         let identifier = expectedOutputIdentifier ?? snapshot.audio.outputIdentifier
-        guard route.isAlive, AudioBluetoothCoordinator.permitsControl(
-            audio: AudioState(outputUID: route.uid, outputKind: route.kind), bluetooth: snapshot.bluetooth
+        guard route.isAlive, audioBluetoothCoordinator.permitsControl(
+            audio: AudioState(outputName: route.name, outputDeviceID: device, outputUID: route.uid,
+                              outputIdentifier: route.identifier, outputKind: route.kind)
         ), AudioOutputIdentity.permitsWrite(
             expectedDeviceID: expected, expectedIdentifier: identifier,
             currentDeviceID: device, currentIdentifier: route.identifier
@@ -194,8 +196,9 @@ final class StatusMonitor: ObservableObject {
         guard !isSleeping, !hasStopped, snapshot.audio.canSetMute else { return false }
         let device = AudioHardware.defaultOutputDevice()
         let route = AudioHardware.readRoute(device: device)
-        guard route.isAlive, AudioBluetoothCoordinator.permitsControl(
-            audio: AudioState(outputUID: route.uid, outputKind: route.kind), bluetooth: snapshot.bluetooth
+        guard route.isAlive, audioBluetoothCoordinator.permitsControl(
+            audio: AudioState(outputName: route.name, outputDeviceID: device, outputUID: route.uid,
+                              outputIdentifier: route.identifier, outputKind: route.kind)
         ), AudioOutputIdentity.permitsWrite(
             expectedDeviceID: expectedDeviceID ?? snapshot.audio.outputDeviceID,
             expectedIdentifier: expectedOutputIdentifier ?? snapshot.audio.outputIdentifier,
@@ -229,6 +232,7 @@ final class StatusMonitor: ObservableObject {
     /// Called when the application terminates. Removing listeners prevents stale callbacks.
     func stop() {
         hasStopped = true
+        lifecycle.invalidate()
         audioBluetoothCoordinator.stop()
         onAudioOutputChange = nil
         cancelOutputRefreshRetries()
@@ -289,8 +293,13 @@ final class StatusMonitor: ObservableObject {
 
     private func observeNotification(_ name: Notification.Name, center: NotificationCenter) {
         let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            let time = ProcessInfo.processInfo.systemUptime
             Task { @MainActor [weak self] in
                 guard let self, self.isRunning else { return }
+                if name == NSWorkspace.willSleepNotification || name == NSWorkspace.didWakeNotification {
+                    guard self.lifecycle.acceptsEvent(at: time) else { return }
+                    self.lifecycle.invalidate()
+                }
                 if name == NSWorkspace.willSleepNotification {
                     self.isSleeping = true
                     self.audioBluetoothCoordinator.setSleeping(true)

@@ -75,4 +75,16 @@ final class BluetoothOutputMatcherTests: XCTestCase {
         let keyboard = BluetoothDeviceState(id: "keyboard", name: "Headphones", kind: .keyboard)
         XCTAssertFalse(BluetoothOutputMatcher.isCurrent(keyboard, audio: audio, devices: [keyboard]))
     }
+
+    func testStoredOpaqueAssociationDoesNotFallBackToAnotherSameNameDevice() {
+        let first = BluetoothDeviceState(id: "AA:BB:CC:DD:EE:FF", name: "Headphones", kind: .headphones)
+        let second = BluetoothDeviceState(id: "11:22:33:44:55:66", name: "Headphones", kind: .headphones)
+        let audio = AudioState(outputName: "Headphones", outputUID: "opaque", outputKind: .bluetoothAudio,
+                               bluetoothDeviceID: first.id)
+        XCTAssertNil(BluetoothOutputMatcher.currentDevice(audio: audio, devices: [second]))
+        XCTAssertEqual(BluetoothOutputMatcher.currentDevice(audio: audio, devices: [second, first])?.id, first.id)
+        var withAddress = audio
+        withAddress.outputUID = "11:22:33:44:55:66:output"
+        XCTAssertEqual(BluetoothOutputMatcher.currentDevice(audio: withAddress, devices: [first, second])?.id, second.id)
+    }
 }
