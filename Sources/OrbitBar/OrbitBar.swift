@@ -32,7 +32,7 @@ final class OrbitBarDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate
     private var subscriptions = Set<AnyCancellable>()
     private var instanceLock: FileHandle?
     private var appearanceObservation: NSKeyValueObservation?
-    private var animatedOutputIdentifier: String?
+    private var volumeAnimationPolicy = VolumeAnimationPolicy()
     private static let reopenNotification = Notification.Name("com.thomas.OrbitBar.showPanel")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -184,9 +184,7 @@ final class OrbitBarDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate
     private func handleSnapshotChange(_ snapshot: SystemSnapshot) {
         // @Published emits before its stored value changes, so use the delivered state.
         updateIcon(snapshotOverride: snapshot)
-        let routeChanged = snapshot.audio.outputIdentifier != animatedOutputIdentifier
-        animatedOutputIdentifier = snapshot.audio.outputIdentifier
-        animator.setVolume(effectiveVolume(snapshot), animated: !routeChanged && snapshot.audio.outputKind != .unavailable)
+        animator.setVolume(effectiveVolume(snapshot), animated: volumeAnimationPolicy.shouldAnimate(snapshot.audio))
     }
 
     private func updateAnimationFrame(_ frame: VolumeMotionFrame) {

@@ -9,12 +9,29 @@ struct StatusGlyphView: View {
     @ObservedObject var settings: AppSettings
     let dark: Bool
     let size: CGFloat
-    @ObservedObject var animator: VolumeAnimator
+    let animator: VolumeAnimator
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             Image(nsImage: IconRenderer.image(snapshot: snapshot, settings: settings,
                                               dark: dark, canvasSize: size, drawVolumeDots: false))
+            AnimatedVolumeDots(animator: animator, dark: dark, size: size)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Keep frame observation in the moving layer so the cached battery/network
+/// image is not requested again on every animation tick.
+@MainActor
+private struct AnimatedVolumeDots: View {
+    @ObservedObject var animator: VolumeAnimator
+    let dark: Bool
+    let size: CGFloat
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
             ForEach(0..<4) { index in
                 let point = IconGeometry.dotCenter(index: index)
                 let intensity = IconGeometry.dotIntensity(index: index, volume: animator.frame.volume)
